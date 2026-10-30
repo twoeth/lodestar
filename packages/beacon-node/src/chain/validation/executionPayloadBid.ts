@@ -16,31 +16,39 @@ import {ExecutionPayloadBidError, ExecutionPayloadBidErrorCode, GossipAction} fr
 import {IBeaconChain} from "../index.js";
 import {RegenCaller} from "../regen/index.js";
 
-/**
- * Relative increment over the current highest bid required to forward a bid, in basis points.
- * With 3%, laddering from 1 gwei to 1 ETH takes ~256 bids given the floor and cap below, see
- * https://github.com/ethereum/consensus-specs/pull/4792#issuecomment-3714553549.
- */
-const BID_INCREMENT_BPS = 300;
-/**
- * Minimum absolute increment (0.0001 ETH). Covers low bid values where the relative increment
- * is tiny and provides weak spam protection.
- */
-const BID_INCREMENT_FLOOR_GWEI = 100_000;
-/**
- * Maximum absolute increment (0.01 ETH). Bounds the barrier for legitimate competition on
- * high value blocks where the relative increment would suppress closely competing bids.
- */
-const BID_INCREMENT_CAP_GWEI = 10_000_000;
+function validateBidValue(chain: IBeaconChain, bid: gloas.ExecutionPayloadBid): void {
+  const parentHash = toRootHex(bid.parentBlockHash);
+  const parentRoot = toRootHex(bid.parentBlockRoot);
+  const seenBestValue = chain.seenExecutionPayloadBids.getBestValue(bid.slot, parentHash, parentRoot);
+  const pooledBestValue = chain.executionPayloadBidPool.getBestBid(bid.slot, parentHash, parentRoot)?.signedBid.message
+    .value;
+  const bestValue = Math.max(seenBestValue ?? -1, pooledBestValue ?? -1);
+  if (bid.value <= bestValue) {
+    throw new ExecutionPayloadBidError(GossipAction.IGNORE, {
+      code: ExecutionPayloadBidErrorCode.BID_TOO_LOW,
+      bidValue: bid.value,
+      currentHighestBid: bestValue,
+    });
+  }
 
-/**
- * Return the minimum value a new bid must have to be forwarded given the current highest bid.
- * Division before multiplication to stay within safe integer range for max gwei values.
- */
-function getMinBidValue(currentHighestBid: number): number {
-  const relativeIncrement = Math.floor(currentHighestBid / 10_000) * BID_INCREMENT_BPS;
-  const increment = Math.min(Math.max(BID_INCREMENT_FLOOR_GWEI, relativeIncrement), BID_INCREMENT_CAP_GWEI);
-  return currentHighestBid + increment;
+  const previousValue = chain.seenExecutionPayloadBids.getValue(bid.slot, bid.builderIndex, parentHash, parentRoot);
+  if (previousValue !== undefined) {
+    const minimumIncrement = Math.min(
+      Math.max(
+        Math.floor(previousValue / 100) * chain.config.MIN_BID_INCREMENT_PERCENT,
+        chain.config.MIN_BID_INCREMENT_FLOOR
+      ),
+      chain.config.MIN_BID_INCREMENT_CAP
+    );
+    if (bid.value < previousValue + minimumIncrement) {
+      throw new ExecutionPayloadBidError(GossipAction.IGNORE, {
+        code: ExecutionPayloadBidErrorCode.BID_INCREMENT_TOO_LOW,
+        bidValue: bid.value,
+        previousBidValue: previousValue,
+        minimumIncrement,
+      });
+    }
+  }
 }
 
 /**
@@ -165,19 +173,7 @@ async function validateExecutionPayloadBid(
     });
   }
 
-  // [IGNORE] this is the first signed bid seen with a valid signature from the given builder for
-  // the tuple `(bid.slot, bid.parent_block_hash, bid.parent_block_root)`.
-  // Entries are only added after signature verification, so known tuples can be dropped before
-  // state regeneration and the other expensive validation steps.
-  if (chain.seenExecutionPayloadBids.isKnown(bid.slot, bid.builderIndex, bidParentBlockHash, bidParentBlockRoot)) {
-    throw new ExecutionPayloadBidError(GossipAction.IGNORE, {
-      code: ExecutionPayloadBidErrorCode.BID_ALREADY_KNOWN,
-      builderIndex: bid.builderIndex,
-      slot: bid.slot,
-      parentBlockRoot: bidParentBlockRoot,
-      parentBlockHash: bidParentBlockHash,
-    });
-  }
+  validateBidValue(chain, bid);
 
   // [IGNORE] `bid.parent_block_root` is the hash tree root of a known beacon block in fork choice.
   // Moved earlier than the spec ordering so we can derive the proposer dependent root for the
@@ -352,19 +348,6 @@ async function validateExecutionPayloadBid(
     });
   }
 
-  // [IGNORE] this bid is the highest value bid seen for the tuple
-  // `(bid.slot, bid.parent_block_hash, bid.parent_block_root)`.
-  // As a DoS prevention measure, the bid must also exceed the current highest bid by a minimum
-  // increment, see https://github.com/ethereum/consensus-specs/pull/4831. This prevents spam
-  // from builders submitting numerous bids with minimal value increments.
-  const bestBid = chain.executionPayloadBidPool.getBestBid(bid.slot, bidParentBlockHash, bidParentBlockRoot);
-  if (bestBid !== null && bid.value < getMinBidValue(bestBid.signedBid.message.value)) {
-    throw new ExecutionPayloadBidError(GossipAction.IGNORE, {
-      code: ExecutionPayloadBidErrorCode.BID_TOO_LOW,
-      bidValue: bid.value,
-      currentHighestBid: bestBid.signedBid.message.value,
-    });
-  }
   // [IGNORE] `bid.value` is less or equal than the builder's excess balance --
   // i.e. `can_builder_cover_bid(state, builder_index, amount)` returns `True`.
   if (!state.canBuilderCoverBid(bid.builderIndex, bid.value)) {
@@ -425,20 +408,11 @@ async function validateExecutionPayloadBid(
     });
   }
 
-  // Repeat the seen check after the awaited signature verification to prevent concurrent bids
-  // for the same builder and tuple from both passing validation.
-  if (chain.seenExecutionPayloadBids.isKnown(bid.slot, bid.builderIndex, bidParentBlockHash, bidParentBlockRoot)) {
-    throw new ExecutionPayloadBidError(GossipAction.IGNORE, {
-      code: ExecutionPayloadBidErrorCode.BID_ALREADY_KNOWN,
-      builderIndex: bid.builderIndex,
-      slot: bid.slot,
-      parentBlockRoot: bidParentBlockRoot,
-      parentBlockHash: bidParentBlockHash,
-    });
-  }
+  // Another bid may have completed validation while this bid awaited state or signature checks.
+  validateBidValue(chain, bid);
 
   // Valid
-  chain.seenExecutionPayloadBids.add(bid.slot, bid.builderIndex, bidParentBlockHash, bidParentBlockRoot);
+  chain.seenExecutionPayloadBids.add(bid.slot, bid.builderIndex, bidParentBlockHash, bidParentBlockRoot, bid.value);
 
   return {proposerIndex: proposerPreferences.message.validatorIndex};
 }
